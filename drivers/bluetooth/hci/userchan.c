@@ -2,7 +2,7 @@
 
 /*
  * Copyright (c) 2018 Intel Corporation
- *
+ * Copyright (c) 2023 Victor Chavez
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -10,7 +10,7 @@
 #include <zephyr/device.h>
 #include <zephyr/init.h>
 #include <zephyr/sys/util.h>
-#include <zephyr/sys/byteorder.h>
+
 
 #include <errno.h>
 #include <stddef.h>
@@ -20,6 +20,10 @@
 #include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 
 #include "soc.h"
 #include "cmdline.h" /* native_posix command line options header */
@@ -56,6 +60,13 @@ static int uc_fd = -1;
 
 static int bt_dev_index = -1;
 
+#define TCP_ADDR_BUFF_SIZE 16
+static bool hci_socket;
+static char ip_addr[TCP_ADDR_BUFF_SIZE] = {0};
+static int port = -1;
+static bool invalid_argument;
+static bool arg_found;
+
 static struct net_buf *get_rx(const uint8_t *buf)
 {
 	bool discardable = false;
@@ -64,7 +75,7 @@ static struct net_buf *get_rx(const uint8_t *buf)
 	switch (buf[0]) {
 	case H4_EVT:
 		if (buf[1] == BT_HCI_EVT_LE_META_EVENT &&
-		    (buf[3] == BT_HCI_EVT_LE_ADVERTISING_REPORT)) {
+			(buf[3] == BT_HCI_EVT_LE_ADVERTISING_REPORT)) {
 			discardable = true;
 			timeout = K_NO_WAIT;
 		}
@@ -185,42 +196,72 @@ static int uc_send(struct net_buf *buf)
 	return 0;
 }
 
-static int user_chan_open(uint16_t index)
+static int user_chan_open(void)
 {
-	struct sockaddr_hci addr;
 	int fd;
 
-	fd = socket(PF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
-		    BTPROTO_HCI);
-	if (fd < 0) {
-		return -errno;
+	if (hci_socket) {
+		struct sockaddr_hci addr;
+
+		fd = socket(PF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+				BTPROTO_HCI);
+		if (fd < 0) {
+			return -errno;
+		}
+
+		(void)memset(&addr, 0, sizeof(addr));
+		addr.hci_family = AF_BLUETOOTH;
+		addr.hci_dev = bt_dev_index;
+		addr.hci_channel = HCI_CHANNEL_USER;
+
+		if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+			int err = -errno;
+
+			close(fd);
+			return err;
+		}
+	} else {
+		struct sockaddr_in addr;
+
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (fd < 0) {
+			return -errno;
+		}
+
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(port);
+		if (inet_pton(AF_INET, ip_addr, &(addr.sin_addr)) <= 0) {
+			close(fd);
+			return -errno;
+		}
+
+		if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+			int err = -errno;
+
+			close(fd);
+			return err;
+		}
 	}
 
-	(void)memset(&addr, 0, sizeof(addr));
-	addr.hci_family = AF_BLUETOOTH;
-	addr.hci_dev = index;
-	addr.hci_channel = HCI_CHANNEL_USER;
-
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		int err = -errno;
-
-		close(fd);
-		return err;
-	}
 
 	return fd;
 }
 
 static int uc_open(void)
 {
-	if (bt_dev_index < 0) {
+	if (!arg_found) {
 		LOG_ERR("No Bluetooth device specified");
 		return -ENODEV;
 	}
 
-	LOG_DBG("hci%d", bt_dev_index);
+	if (hci_socket) {
+		LOG_DBG("hci%d", bt_dev_index);
+	} else {
+		LOG_DBG("hci %s:%d", ip_addr, port);
+	}
 
-	uc_fd = user_chan_open(bt_dev_index);
+
+	uc_fd = user_chan_open();
 	if (uc_fd < 0) {
 		return uc_fd;
 	}
@@ -257,14 +298,16 @@ SYS_INIT(bt_uc_init, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 
 static void cmd_bt_dev_found(char *argv, int offset)
 {
-	if (strncmp(&argv[offset], "hci", 3) || strlen(&argv[offset]) < 4) {
-		posix_print_error_and_exit("Error: Invalid Bluetooth device "
-					   "name '%s' (should be e.g. hci0)\n",
-					   &argv[offset]);
-		return;
+	arg_found = true;
+	if (strncmp(&argv[offset], "hci", 3) == 0 && strlen(&argv[offset]) >= 4) {
+		/* It's a hciX string */
+		hci_socket = true;
+		bt_dev_index = strtol(&argv[offset + 3], NULL, 10);
+	} else if (sscanf(&argv[offset], "%15[^:]:%d", ip_addr, &port) == 2) {
+		hci_socket = false;
+	} else {
+		invalid_argument = true;
 	}
-
-	bt_dev_index = strtol(&argv[offset + 3], NULL, 10);
 }
 
 static void add_btuserchan_arg(void)
@@ -289,9 +332,24 @@ static void add_btuserchan_arg(void)
 
 static void btuserchan_check_arg(void)
 {
-	if (bt_dev_index < 0) {
-		posix_print_error_and_exit("Error: Bluetooth device missing. "
-					   "Specify one using --bt-dev=hciN\n");
+	if (!arg_found) {
+		posix_print_error_and_exit("Error: Bluetooth device missing.\n"
+									"Specify either a local hci interface --bt-dev=hciN\n"
+									"or a valid Bluetooth HCI TCP Server --bt-dev=ip_address:<port>\n");
+	}
+	if (hci_socket) {
+		if (bt_dev_index < 0) {
+			posix_print_error_and_exit("Error: Bluetooth device missing. "
+										"Specify one using --bt-dev=hciN\n");
+		}
+	} else {
+		struct in_addr addr;
+
+		if (inet_pton(AF_INET, ip_addr, &addr) != 1) {
+			posix_print_error_and_exit("Error: IP Addr/Port for Bluetooth "
+										"device is incorrect\n");
+			return;
+		}
 	}
 }
 
