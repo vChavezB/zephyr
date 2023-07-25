@@ -102,6 +102,45 @@ static bool uc_ready(void)
 	return (poll(&pollfd, 1, 0) == 1);
 }
 
+static uint16_t hci_get_packet_length(uint8_t packet_type, uint8_t * packet)
+{
+	uint16_t payload_size = 0;
+	uint8_t header_size = 0;
+	const uint8_t packet_type_len = 1;
+
+	switch(packet_type) {
+		/* Bluetooth spec 5.2 Vol 4, Part E - 5.4.1 HCI Command Packet */
+		case H4_CMD:
+			payload_size = packet[3];
+			header_size = 3;
+			break;
+		/* Bluetooth spec 5.2 Vol 4, Part E - 5.4.2 ACL Data Packets */
+		case H4_ACL:
+			payload_size = packet[4] << 8 | packet[3];
+			header_size = 4;
+			break;
+		/* Bluetooth spec 5.2 Vol 4, Part E - 5.4.3 HCI Synchronous Data Packets */	
+		case H4_SCO:
+			payload_size = packet[3];
+			header_size = 3;
+		/* Bluetooth spec 5.2 Vol 4, Part E - 5.4.4 HCI Event Packet */
+		case H4_EVT:
+			payload_size = packet[2];
+			header_size = 2;
+			break;
+		/* Bluetooth spec 5.2 Vol 4, Part E - 5.4.5 HCI ISO Data Packets */
+		case H4_ISO:
+			payload_size = ((packet[4] << 8) & 0x3F)| packet[3];
+			header_size = 4;
+		default:
+			break;
+	}
+	if (header_size == 0) {
+		return 0;
+	}
+	return packet_type_len + header_size + payload_size;
+}
+
 static void rx_thread(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -136,27 +175,43 @@ static void rx_thread(void *p1, void *p2, void *p3)
 			uc_fd = -1;
 			return;
 		}
+		uint8_t * frame_start = frame;
+		
+		while (len > 0 ) {
+			
+			const uint8_t packet_type = frame_start[0];
+			const uint16_t packet_len = hci_get_packet_length(packet_type, frame_start);
+			
+			if (packet_len == 0) {
+				LOG_ERR("HCI Packet length could not be decoded");
+				break;
+			}
+			if (packet_len > len ) {
+				LOG_ERR("HCI Packet length is greater than recieved buffer length");
+				break;
+			}
+			buf = get_rx(frame_start);
+			if (!buf) {
+				LOG_DBG("Discard adv report due to insufficient buf");
+				continue;
+			}
 
-		buf = get_rx(frame);
-		if (!buf) {
-			LOG_DBG("Discard adv report due to insufficient buf");
-			continue;
+			buf_tailroom = net_buf_tailroom(buf);
+			buf_add_len = packet_len-1;
+			if (buf_tailroom < buf_add_len) {
+				LOG_ERR("Not enough space in buffer %zu/%zu", buf_add_len, buf_tailroom);
+				net_buf_unref(buf);
+				continue;
+			}
+
+			net_buf_add_mem(buf, frame_start + 1, buf_add_len);
+
+			LOG_DBG("Calling bt_recv(%p)", buf);
+
+			bt_recv(buf);
+			len -= packet_len;
+			frame_start+=packet_len;
 		}
-
-		buf_tailroom = net_buf_tailroom(buf);
-		buf_add_len = len - 1;
-		if (buf_tailroom < buf_add_len) {
-			LOG_ERR("Not enough space in buffer %zu/%zu", buf_add_len, buf_tailroom);
-			net_buf_unref(buf);
-			continue;
-		}
-
-		net_buf_add_mem(buf, &frame[1], buf_add_len);
-
-		LOG_DBG("Calling bt_recv(%p)", buf);
-
-		bt_recv(buf);
-
 		k_yield();
 	}
 }
