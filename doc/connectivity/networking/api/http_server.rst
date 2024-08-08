@@ -103,7 +103,7 @@ macro:
 
     HTTP_SERVICE_DEFINE(my_service, "0.0.0.0", &http_service_port, 1, 10, NULL);
 
-Alternatively, an HTTPS service can be defined with with
+Alternatively, an HTTPS service can be defined with
 :c:macro:`HTTPS_SERVICE_DEFINE`:
 
 .. code-block:: c
@@ -186,6 +186,38 @@ following code to the application's ``CMakeLists.txt`` file:
     generate_inc_file_for_target(app ${source_file_index} ${gen_dir}/index.html.gz.inc --gzip)
 
 where ``src/index.html`` is the location of the webpage to be compressed.
+
+Static filesystem resources
+===========================
+
+Static filesystem resource content is defined build-time and is immutable. The following
+example shows how the path can be defined as a static resource in the application:
+
+.. code-block:: c
+
+    struct http_resource_detail_static_fs static_fs_resource_detail = {
+        .common = {
+            .type                              = HTTP_RESOURCE_TYPE_STATIC_FS,
+            .bitmask_of_supported_http_methods = BIT(HTTP_GET),
+        },
+        .fs_path = "/lfs1/www",
+    };
+
+    HTTP_RESOURCE_DEFINE(static_fs_resource, my_service, "*", &static_fs_resource_detail);
+
+All files located in /lfs1/www are made available to the client. If a file is
+gzipped, .gz must be appended to the file name (e.g. index.html.gz), then the
+server delivers index.html.gz when the client requests index.html and adds gzip
+content-encoding to the HTTP header.
+
+The content type is evaluated based on the file extension. The server supports
+.html, .js, .css, .jpg, .png and .svg. More content types can be provided with the
+:c:macro:`HTTP_SERVER_CONTENT_TYPE` macro. All other files are provided with the
+content type text/html.
+
+.. code-block:: c
+
+    HTTP_SERVER_CONTENT_TYPE(json, "application/json")
 
 Dynamic resources
 =================
@@ -277,7 +309,7 @@ in the reply.
 Websocket resources
 ===================
 
-Websocket resources register an application callback, which is is called when a
+Websocket resources register an application callback, which is called when a
 Websocket connection upgrade takes place. The callback is provided with a socket
 descriptor corresponding to the underlying TCP/TLS connection. Once called,
 the application takes full control over the socket, i. e. is responsible to

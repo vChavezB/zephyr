@@ -114,6 +114,10 @@ struct bt_conn_le {
 #if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
 	struct bt_conn_le_data_len_info data_len;
 #endif
+
+#if defined(CONFIG_BT_SUBRATING)
+	struct bt_conn_le_subrating_info subrate;
+#endif
 };
 
 #if defined(CONFIG_BT_CLASSIC)
@@ -187,7 +191,12 @@ struct acl_data {
 	struct bt_buf_data buf_data;
 
 	/* Index into the bt_conn storage array */
-	uint8_t  index;
+	uint8_t index;
+
+	/** Host has already sent a Host Number of Completed Packets
+	 *  for this buffer.
+	 */
+	bool host_ncp_sent;
 
 	/** ACL connection handle */
 	uint16_t handle;
@@ -437,7 +446,7 @@ static inline bool bt_conn_is_handle_valid(struct bt_conn *conn)
 bool bt_conn_is_peer_addr_le(const struct bt_conn *conn, uint8_t id,
 			     const bt_addr_le_t *peer);
 
-/* Helpers for identifying & looking up connections based on the the index to
+/* Helpers for identifying & looking up connections based on the index to
  * the connection list. This is useful for O(1) lookups, but can't be used
  * e.g. as the handle since that's assigned to us by the controller.
  */
@@ -473,6 +482,9 @@ void notify_tx_power_report(struct bt_conn *conn,
 
 void notify_path_loss_threshold_report(struct bt_conn *conn,
 				       struct bt_conn_le_path_loss_threshold_report report);
+
+void notify_subrate_change(struct bt_conn *conn,
+			   struct bt_conn_le_subrate_changed params);
 
 #if defined(CONFIG_BT_SMP)
 /* If role specific LTK is present */
@@ -547,5 +559,11 @@ void bt_conn_tx_processor(void);
 
 /* To be called by upper layers when they want to send something.
  * Functions just like an IRQ.
+ *
+ * Note: This fn will take and hold a reference to `conn` until the IRQ for that
+ * conn is serviced.
+ * For the current implementation, that means:
+ * - ref the conn when putting on an "conn-ready" slist
+ * - unref the conn when popping the conn from the slist
  */
 void bt_conn_data_ready(struct bt_conn *conn);

@@ -339,10 +339,11 @@ void bt_conn_reset_rx_state(struct bt_conn *conn)
 	conn->rx = NULL;
 }
 
-static void bt_acl_recv(struct bt_conn *conn, struct net_buf *buf,
-			uint8_t flags)
+static void bt_acl_recv(struct bt_conn *conn, struct net_buf *buf, uint8_t flags)
 {
 	uint16_t acl_total_len;
+
+	bt_acl_set_ncp_sent(buf, false);
 
 	/* Check packet boundary flags */
 	switch (flags) {
@@ -355,7 +356,7 @@ static void bt_acl_recv(struct bt_conn *conn, struct net_buf *buf,
 		LOG_DBG("First, len %u final %u", buf->len,
 			(buf->len < sizeof(uint16_t)) ? 0 : sys_get_le16(buf->data));
 
-		conn->rx = buf;
+		conn->rx = net_buf_ref(buf);
 		break;
 	case BT_ACL_CONT:
 		if (!conn->rx) {
@@ -385,7 +386,6 @@ static void bt_acl_recv(struct bt_conn *conn, struct net_buf *buf,
 		}
 
 		net_buf_add_mem(conn->rx, buf->data, buf->len);
-		net_buf_unref(buf);
 		break;
 	default:
 		/* BT_ACL_START_NO_FLUSH and BT_ACL_COMPLETE are not allowed on
@@ -402,6 +402,10 @@ static void bt_acl_recv(struct bt_conn *conn, struct net_buf *buf,
 		/* Still not enough data received to retrieve the L2CAP header
 		 * length field.
 		 */
+		bt_send_one_host_num_completed_packets(conn->handle);
+		bt_acl_set_ncp_sent(buf, true);
+		net_buf_unref(buf);
+
 		return;
 	}
 
@@ -409,8 +413,14 @@ static void bt_acl_recv(struct bt_conn *conn, struct net_buf *buf,
 
 	if (conn->rx->len < acl_total_len) {
 		/* L2CAP frame not complete. */
+		bt_send_one_host_num_completed_packets(conn->handle);
+		bt_acl_set_ncp_sent(buf, true);
+		net_buf_unref(buf);
+
 		return;
 	}
+
+	net_buf_unref(buf);
 
 	if (conn->rx->len > acl_total_len) {
 		LOG_ERR("ACL len mismatch (%u > %u)", conn->rx->len, acl_total_len);
@@ -421,6 +431,8 @@ static void bt_acl_recv(struct bt_conn *conn, struct net_buf *buf,
 	/* L2CAP frame complete. */
 	buf = conn->rx;
 	conn->rx = NULL;
+
+	__ASSERT(buf->ref == 1, "buf->ref %d", buf->ref);
 
 	LOG_DBG("Successfully parsed %u byte L2CAP packet", buf->len);
 	bt_l2cap_recv(conn, buf, true);
@@ -518,6 +530,20 @@ static int send_acl(struct bt_conn *conn, struct net_buf *buf, uint8_t flags)
 	return bt_send(buf);
 }
 
+static enum bt_iso_timestamp contains_iso_timestamp(struct net_buf *buf)
+{
+	enum bt_iso_timestamp ts;
+
+	if (net_buf_headroom(buf) ==
+	    (BT_BUF_ISO_SIZE(0) - sizeof(struct bt_hci_iso_sdu_ts_hdr))) {
+		ts = BT_ISO_TS_PRESENT;
+	} else {
+		ts = BT_ISO_TS_ABSENT;
+	}
+
+	return ts;
+}
+
 static int send_iso(struct bt_conn *conn, struct net_buf *buf, uint8_t flags)
 {
 	struct bt_hci_iso_hdr *hdr;
@@ -548,7 +574,7 @@ static int send_iso(struct bt_conn *conn, struct net_buf *buf, uint8_t flags)
 	 * every fragment, only the first one.
 	 */
 	if (flags == BT_ISO_SINGLE || flags == BT_ISO_START) {
-		ts = (enum bt_iso_timestamp)net_buf_pull_u8(buf);
+		ts = contains_iso_timestamp(buf);
 	} else {
 		ts = BT_ISO_TS_ABSENT;
 	}
@@ -624,7 +650,8 @@ static int send_buf(struct bt_conn *conn, struct net_buf *buf,
 		return -EIO;
 	}
 
-	LOG_DBG("conn %p buf %p len %u buf->len %u", conn, buf, len, buf->len);
+	LOG_DBG("conn %p buf %p len %u buf->len %u cb %p ud %p",
+		conn, buf, len, buf->len, cb, ud);
 
 	/* Acquire the right to send 1 packet to the controller */
 	if (k_sem_take(bt_conn_get_pkts(conn), K_NO_WAIT)) {
@@ -773,6 +800,10 @@ static bool should_stop_tx(struct bt_conn *conn)
 {
 	LOG_DBG("%p", conn);
 
+	if (conn->state != BT_CONN_CONNECTED) {
+		return true;
+	}
+
 	/* TODO: This function should be overridable by the application: they
 	 * should be able to provide their own heuristic.
 	 */
@@ -804,6 +835,12 @@ void bt_conn_data_ready(struct bt_conn *conn)
 
 	/* The TX processor will call the `pull_cb` to get the buf */
 	if (!atomic_set(&conn->_conn_ready_lock, 1)) {
+		/* Attach a reference to the `bt_dev.le.conn_ready` list.
+		 *
+		 * This reference will be consumed when the conn is popped off
+		 * the list (in `get_conn_ready`).
+		 */
+		bt_conn_ref(conn);
 		sys_slist_append(&bt_dev.le.conn_ready,
 				 &conn->_conn_ready);
 		LOG_DBG("raised");
@@ -839,7 +876,7 @@ static bool dont_have_viewbufs(void)
 #endif	/* CONFIG_BT_CONN_TX */
 }
 
-static bool dont_have_methods(struct bt_conn *conn)
+__maybe_unused static bool dont_have_methods(struct bt_conn *conn)
 {
 	return (conn->tx_data_pull == NULL) ||
 		(conn->get_and_clear_cb == NULL) ||
@@ -857,6 +894,12 @@ struct bt_conn *get_conn_ready(void)
 		return NULL;
 	}
 
+	/* `conn` borrows from the list node. That node is _not_ popped yet.
+	 *
+	 * If we end up not popping that conn off the list, we have to make sure
+	 * to increase the refcount before returning a pointer to that
+	 * connection out of this function.
+	 */
 	struct bt_conn *conn = CONTAINER_OF(node, struct bt_conn, _conn_ready);
 
 	if (dont_have_viewbufs()) {
@@ -887,6 +930,7 @@ struct bt_conn *get_conn_ready(void)
 	}
 
 	if (should_stop_tx(conn)) {
+		/* Move reference off the list and into the `conn` variable. */
 		__maybe_unused sys_snode_t *s = sys_slist_get(&bt_dev.le.conn_ready);
 
 		__ASSERT_NO_MSG(s == node);
@@ -902,9 +946,11 @@ struct bt_conn *get_conn_ready(void)
 			LOG_DBG("appending %p to back of TX queue", conn);
 			bt_conn_data_ready(conn);
 		}
+
+		return conn;
 	}
 
-	return conn;
+	return bt_conn_ref(conn);
 }
 
 /* Crazy that this file is compiled even if this is not true, but here we are. */
@@ -985,7 +1031,8 @@ void bt_conn_tx_processor(void)
 	LOG_DBG("processing conn %p", conn);
 
 	if (conn->state != BT_CONN_CONNECTED) {
-		LOG_ERR("conn %p: not connected", conn);
+		LOG_WRN("conn %p: not connected", conn);
+
 		/* Call the user callbacks & destroy (final-unref) the buffers
 		 * we were supposed to send.
 		 */
@@ -994,7 +1041,8 @@ void bt_conn_tx_processor(void)
 			destroy_and_callback(conn, buf, cb, ud);
 			buf = conn->tx_data_pull(conn, SIZE_MAX, &buf_len);
 		}
-		return;
+
+		goto exit;
 	}
 
 	/* now that we are guaranteed resources, we can pull data from the upper
@@ -1008,12 +1056,12 @@ void bt_conn_tx_processor(void)
 		 * the upper layer when it has more data.
 		 */
 		LOG_DBG("no buf returned");
-		return;
+
+		goto exit;
 	}
 
 	bool last_buf = conn_mtu(conn) >= buf_len;
 
-	/* TODO: add sdu_sent callback on last PDU */
 	if (last_buf) {
 		/* Only pull the callback info from the last buffer.
 		 * We still allocate one TX context per-fragment though.
@@ -1044,13 +1092,17 @@ void bt_conn_tx_processor(void)
 		destroy_and_callback(conn, buf, cb, ud);
 		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 
-		return;
+		goto exit;
 	}
 
 	/* Always kick the TX work. It will self-suspend if it doesn't get
 	 * resources or there is nothing left to send.
 	 */
 	bt_tx_irq_raise();
+
+exit:
+	/* Give back the ref that `get_conn_ready()` gave us */
+	bt_conn_unref(conn);
 }
 
 static void process_unack_tx(struct bt_conn *conn)
@@ -1193,13 +1245,6 @@ void bt_conn_set_state(struct bt_conn *conn, bt_conn_state_t state)
 		case BT_CONN_DISCONNECT_COMPLETE:
 			wait_for_tx_work(conn);
 
-			/* Cancel Connection Update if it is pending */
-			if ((conn->type == BT_CONN_TYPE_LE) &&
-			    (k_work_delayable_busy_get(&conn->deferred_work) &
-			     (K_WORK_QUEUED | K_WORK_DELAYED))) {
-				k_work_cancel_delayable(&conn->deferred_work);
-			}
-
 			LOG_DBG("trigger disconnect work");
 			k_work_reschedule(&conn->deferred_work, K_NO_WAIT);
 
@@ -1338,6 +1383,11 @@ found:
 		bt_conn_unref(conn);
 	}
 	return NULL;
+}
+
+struct bt_conn *bt_hci_conn_lookup_handle(uint16_t handle)
+{
+	return bt_conn_lookup_handle(handle, BT_CONN_TYPE_ALL);
 }
 
 void bt_conn_foreach(enum bt_conn_type type,
@@ -2718,6 +2768,9 @@ int bt_conn_get_info(const struct bt_conn *conn, struct bt_conn_info *info)
 #if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
 		info->le.data_len = &conn->le.data_len;
 #endif
+#if defined(CONFIG_BT_SUBRATING)
+		info->le.subrate = &conn->le.subrate;
+#endif
 		if (conn->le.keys && (conn->le.keys->flags & BT_KEYS_SC)) {
 			info->security.flags |= BT_SECURITY_FLAG_SC;
 		}
@@ -3002,20 +3055,114 @@ int bt_conn_le_set_path_loss_mon_enable(struct bt_conn *conn, bool reporting_ena
 }
 #endif /* CONFIG_BT_PATH_LOSS_MONITORING */
 
+#if defined(CONFIG_BT_SUBRATING)
+void notify_subrate_change(struct bt_conn *conn,
+			   const struct bt_conn_le_subrate_changed params)
+{
+	struct bt_conn_cb *callback;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&conn_cbs, callback, _node) {
+		if (callback->subrate_changed) {
+			callback->subrate_changed(conn, &params);
+		}
+	}
+
+	STRUCT_SECTION_FOREACH(bt_conn_cb, cb)
+	{
+		if (cb->subrate_changed) {
+			cb->subrate_changed(conn, &params);
+		}
+	}
+}
+
+static bool le_subrate_common_params_valid(const struct bt_conn_le_subrate_param *param)
+{
+	/* All limits according to BT Core spec 5.4 [Vol 4, Part E, 7.8.123] */
+
+	if (param->subrate_min < 0x0001 || param->subrate_min > 0x01F4 ||
+	    param->subrate_max < 0x0001 || param->subrate_max > 0x01F4 ||
+	    param->subrate_min > param->subrate_max) {
+		return false;
+	}
+
+	if (param->max_latency > 0x01F3 ||
+	    param->subrate_max * (param->max_latency + 1) > 500) {
+		return false;
+	}
+
+	if (param->continuation_number > 0x01F3 ||
+	    param->continuation_number >= param->subrate_max) {
+		return false;
+	}
+
+	if (param->supervision_timeout < 0x000A ||
+	    param->supervision_timeout > 0xC80) {
+		return false;
+	}
+
+	return true;
+}
+
+int bt_conn_le_subrate_set_defaults(const struct bt_conn_le_subrate_param *params)
+{
+	struct bt_hci_cp_le_set_default_subrate *cp;
+	struct net_buf *buf;
+
+	if (!IS_ENABLED(CONFIG_BT_CENTRAL)) {
+		return -ENOTSUP;
+	}
+
+	if (!le_subrate_common_params_valid(params)) {
+		return -EINVAL;
+	}
+
+	buf = bt_hci_cmd_create(BT_HCI_OP_LE_SET_DEFAULT_SUBRATE, sizeof(*cp));
+	if (!buf) {
+		return -ENOBUFS;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->subrate_min = sys_cpu_to_le16(params->subrate_min);
+	cp->subrate_max = sys_cpu_to_le16(params->subrate_max);
+	cp->max_latency = sys_cpu_to_le16(params->max_latency);
+	cp->continuation_number = sys_cpu_to_le16(params->continuation_number);
+	cp->supervision_timeout = sys_cpu_to_le16(params->supervision_timeout);
+
+	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_DEFAULT_SUBRATE, buf, NULL);
+}
+
+int bt_conn_le_subrate_request(struct bt_conn *conn,
+			       const struct bt_conn_le_subrate_param *params)
+{
+	struct bt_hci_cp_le_subrate_request *cp;
+	struct net_buf *buf;
+
+	if (!le_subrate_common_params_valid(params)) {
+		return -EINVAL;
+	}
+
+	buf = bt_hci_cmd_create(BT_HCI_OP_LE_SUBRATE_REQUEST, sizeof(*cp));
+	if (!buf) {
+		return -ENOBUFS;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->subrate_min = sys_cpu_to_le16(params->subrate_min);
+	cp->subrate_max = sys_cpu_to_le16(params->subrate_max);
+	cp->max_latency = sys_cpu_to_le16(params->max_latency);
+	cp->continuation_number = sys_cpu_to_le16(params->continuation_number);
+	cp->supervision_timeout = sys_cpu_to_le16(params->supervision_timeout);
+
+	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_SUBRATE_REQUEST, buf, NULL);
+}
+#endif /* CONFIG_BT_SUBRATING */
+
 int bt_conn_le_param_update(struct bt_conn *conn,
 			    const struct bt_le_conn_param *param)
 {
 	LOG_DBG("conn %p features 0x%02x params (%d-%d %d %d)", conn, conn->le.features[0],
 		param->interval_min, param->interval_max, param->latency, param->timeout);
-
-	/* Check if there's a need to update conn params */
-	if (conn->le.interval >= param->interval_min &&
-	    conn->le.interval <= param->interval_max &&
-	    conn->le.latency == param->latency &&
-	    conn->le.timeout == param->timeout) {
-		atomic_clear_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_SET);
-		return -EALREADY;
-	}
 
 	if (IS_ENABLED(CONFIG_BT_CENTRAL) &&
 	    conn->role == BT_CONN_ROLE_CENTRAL) {

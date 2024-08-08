@@ -170,6 +170,10 @@ The Zephyr nucleo_h533re board configuration supports the following hardware fea
 +-----------+------------+-------------------------------------+
 | WATCHDOG  | on-chip    | independent watchdog                |
 +-----------+------------+-------------------------------------+
+| ADC       | on-chip    | ADC Controller                      |
++-----------+------------+-------------------------------------+
+| USB       | on-chip    | USB full-speed host/device bus      |
++-----------+------------+-------------------------------------+
 
 Other hardware features are not yet supported on this Zephyr port.
 
@@ -205,9 +209,9 @@ For more details please refer to `STM32H5 Nucleo-64 board User Manual`_.
 Default Zephyr Peripheral Mapping:
 ----------------------------------
 
-- ADC1 channel 14 input: PB1
+- ADC1 channel 0 input: PA0
 - USART1 TX/RX : PB14/PB15 (Arduino USART1)
-- SPI1 SCK/MISO/MOSI/NSS: PA5/PA6/PA7/PC9
+- SPI1 SCK/MISO/MOSI/NSS: PA5/PA6/PA7/PA4
 - UART2 TX/RX : PA2/PA3 (VCP)
 - USER_PB : PC13
 
@@ -221,7 +225,7 @@ as well as main PLL clock. By default System clock is driven by PLL clock at
 Serial Port
 -----------
 
-Nucleo H533RE board has up to 6 U(S)ARTs. The Zephyr console output is assigned
+Nucleo H533RE board has up to 4 USARTs, 2 UARTs, and one LPUART. The Zephyr console output is assigned
 to USART2. Default settings are 115200 8N1.
 
 Programming and Debugging
@@ -230,6 +234,24 @@ Programming and Debugging
 Applications for the ``nucleo_h533re`` board can be built and
 flashed in the usual way (see :ref:`build_an_application` and
 :ref:`application_run` for more details).
+
+OpenOCD Support
+===============
+
+For now, openocd support  for stm32h5 is not available on upstream OpenOCD.
+You can check `OpenOCD official Github mirror`_.
+In order to use it though, you should clone from the cutomized
+`STMicroelectronics OpenOCD Github`_ and compile it following usual README guidelines.
+Once it is done, you can set the OPENOCD and OPENOCD_DEFAULT_PATH variables in
+:zephyr_file:`boards/st/nucleo_h533re/board.cmake` to point the build
+to the paths of the OpenOCD binary and its scripts,  before
+including the common openocd.board.cmake file:
+
+   .. code-block:: none
+
+      set(OPENOCD "<path_to_openocd_repo>/src/openocd" CACHE FILEPATH "" FORCE)
+      set(OPENOCD_DEFAULT_PATH <path_to_opneocd_repo>/tcl)
+      include(${ZEPHYR_BASE}/boards/common/openocd.board.cmake)
 
 Flashing
 ========
@@ -251,6 +273,10 @@ This can be done by executing the following commands.
 
    $ pyocd pack --update
    $ pyocd pack --install stm32h5
+
+
+Alternatively, the openocd interface will be supported by a next openocd version.
+When available, OpenOCD could be used in the same way as other tools.
 
 
 Flashing an application to Nucleo H533RE
@@ -304,3 +330,9 @@ You can debug an application in the usual way. Here is an example for the
 
 .. _STM32CubeProgrammer:
    https://www.st.com/en/development-tools/stm32cubeprog.html
+
+.. _OpenOCD official Github mirror:
+   https://github.com/openocd-org/openocd/
+
+.. _STMicroelectronics OpenOCD Github:
+   https://github.com/STMicroelectronics/OpenOCD/tree/openocd-cubeide-r6

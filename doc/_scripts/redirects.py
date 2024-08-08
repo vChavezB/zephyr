@@ -143,6 +143,7 @@ REDIRECTS = [
     ('guides/west/workspaces', 'develop/west/workspaces'),
     ('guides/west/zephyr-cmds', 'develop/west/zephyr-cmds'),
     ('guides/zephyr_cmake_package', 'build/zephyr_cmake_package'),
+    ('hardware/peripherals/eeprom', 'hardware/peripherals/eeprom/index'),
     ('hardware/peripherals/sensor', 'hardware/peripherals/sensor/index'),
     ('reference/api/api_lifecycle', 'develop/api/api_lifecycle'),
     ('reference/api/index', 'develop/api/index'),
@@ -217,6 +218,9 @@ REDIRECTS = [
     ('samples/net/cloud/google_iot_mqtt/README', 'samples/net/cloud/cloud'),
     ('samples/sensor/wsen_hids/README', 'samples/sensor/sensor'),
     ('samples/sensor/wsen_itds/README', 'samples/sensor/sensor'),
+    ('samples/subsys/video/capture/README', 'samples/drivers/video/capture/README'),
+    ('samples/subsys/video/tcpserversink/README', 'samples/drivers/video/tcpserversink/README'),
+    ('samples/subsys/video/video', 'samples/drivers/video/video'),
     ('services/portability/posix', 'services/portability/posix/index'),
     # zephyr-keep-sorted-stop
 ]

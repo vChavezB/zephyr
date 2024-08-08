@@ -35,6 +35,7 @@ source "drivers/fpga/Kconfig"
 source "drivers/fuel_gauge/Kconfig"
 source "drivers/gnss/Kconfig"
 source "drivers/gpio/Kconfig"
+source "drivers/haptics/Kconfig"
 source "drivers/hwinfo/Kconfig"
 source "drivers/hwspinlock/Kconfig"
 source "drivers/i2c/Kconfig"
@@ -89,5 +90,7 @@ source "drivers/watchdog/Kconfig"
 source "drivers/wifi/Kconfig"
 source "drivers/xen/Kconfig"
 # zephyr-keep-sorted-stop
+
+source "drivers/tee/Kconfig"
 
 endmenu

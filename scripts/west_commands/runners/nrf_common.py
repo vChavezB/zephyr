@@ -229,19 +229,20 @@ class NrfBinaryRunner(ZephyrBinaryRunner):
 
 
     def recover_target(self):
-        if self.family == 'NRF53_FAMILY':
+        if self.family in ('NRF53_FAMILY', 'NRF54H_FAMILY'):
             self.logger.info(
                 'Recovering and erasing flash memory for both the network '
                 'and application cores.')
         else:
             self.logger.info('Recovering and erasing all flash memory.')
 
-        # The network core needs to be recovered first due to the fact that
-        # recovering it erases the flash of *both* cores. Since a recover
-        # operation unlocks the core and then flashes a small image that keeps
-        # the debug access port open, recovering the network core last would
-        # result in that small image being deleted from the app core.
-        if self.family == 'NRF53_FAMILY':
+        # The network core of the nRF53 needs to be recovered first due to the
+        # fact that recovering it erases the flash of *both* cores. Since a
+        # recover operation unlocks the core and then flashes a small image that
+        # keeps the debug access port open, recovering the network core last
+        # would result in that small image being deleted from the app core.
+        # In the case of the 54H, the order is indifferent.
+        if self.family in ('NRF53_FAMILY', 'NRF54H_FAMILY'):
             self.exec_op('recover', core='NRFDL_DEVICE_CORE_NETWORK')
 
         self.exec_op('recover')
@@ -264,14 +265,14 @@ class NrfBinaryRunner(ZephyrBinaryRunner):
             # This logic should be executed only once per build.
             # Use sysbuild board qualifiers to select the context, with which the artifacts will be programmed.
             if self.build_conf.get('CONFIG_BOARD_QUALIFIERS') == self.sysbuild_conf.get('SB_CONFIG_BOARD_QUALIFIERS'):
-                hex_path = Path(self.hex_)
+                mpi_hex_dir = Path(os.path.join(self.cfg.build_dir, 'zephyr'))
 
                 # Handle Manifest Provisioning Information
                 if self.build_conf.getboolean('CONFIG_SUIT_MPI_GENERATE'):
                     app_mpi_hex_file = os.fspath(
-                        hex_path.parent / self.build_conf.get('CONFIG_SUIT_MPI_APP_AREA_PATH'))
+                        mpi_hex_dir / self.build_conf.get('CONFIG_SUIT_MPI_APP_AREA_PATH'))
                     rad_mpi_hex_file = os.fspath(
-                        hex_path.parent / self.build_conf.get('CONFIG_SUIT_MPI_RAD_AREA_PATH'))
+                        mpi_hex_dir / self.build_conf.get('CONFIG_SUIT_MPI_RAD_AREA_PATH'))
                     self.op_program(app_mpi_hex_file, 'ERASE_NONE', None, defer=True, core='NRFDL_DEVICE_CORE_APPLICATION')
                     self.op_program(rad_mpi_hex_file, 'ERASE_NONE', None, defer=True, core='NRFDL_DEVICE_CORE_NETWORK')
 
@@ -280,7 +281,7 @@ class NrfBinaryRunner(ZephyrBinaryRunner):
                 # as well as the output HEX file.
                 if not self.build_conf.getboolean('CONFIG_SOC_NRF54H20_CPUAPP') and self.sysbuild_conf.get('SB_CONFIG_SUIT_ENVELOPE'):
                     app_root_envelope_hex_file = os.fspath(
-                        hex_path.parent / 'suit_installed_envelopes_application_merged.hex')
+                        mpi_hex_dir / 'suit_installed_envelopes_application_merged.hex')
                     self.op_program(app_root_envelope_hex_file, 'ERASE_NONE', None, defer=True, core='NRFDL_DEVICE_CORE_APPLICATION')
 
             if self.build_conf.getboolean('CONFIG_SOC_NRF54H20_CPUAPP'):

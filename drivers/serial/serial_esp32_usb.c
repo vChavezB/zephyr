@@ -142,7 +142,9 @@ static void serial_esp32_usb_irq_tx_enable(const struct device *dev)
 	usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
 
 	if (data->irq_cb != NULL) {
+		unsigned int key = irq_lock();
 		data->irq_cb(dev, data->irq_cb_data);
+		arch_irq_unlock(key);
 	}
 }
 
@@ -220,8 +222,8 @@ static void serial_esp32_usb_irq_callback_set(const struct device *dev,
 {
 	struct serial_esp32_usb_data *data = dev->data;
 
-	data->irq_cb = cb;
 	data->irq_cb_data = cb_data;
+	data->irq_cb = cb;
 }
 
 static void serial_esp32_usb_isr(void *arg)
@@ -272,6 +274,6 @@ static const DRAM_ATTR struct serial_esp32_usb_config serial_esp32_usb_cfg = {
 
 static struct serial_esp32_usb_data serial_esp32_usb_data_0;
 
-DEVICE_DT_INST_DEFINE(0, &serial_esp32_usb_init, NULL, &serial_esp32_usb_data_0,
+DEVICE_DT_INST_DEFINE(0, serial_esp32_usb_init, NULL, &serial_esp32_usb_data_0,
 		      &serial_esp32_usb_cfg, PRE_KERNEL_1,
 		      CONFIG_SERIAL_INIT_PRIORITY, &serial_esp32_usb_api);

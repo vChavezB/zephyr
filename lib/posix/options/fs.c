@@ -92,14 +92,14 @@ int zvfs_open(const char *name, int flags)
 		return zmode;
 	}
 
-	fd = z_reserve_fd();
+	fd = zvfs_reserve_fd();
 	if (fd < 0) {
 		return -1;
 	}
 
 	ptr = posix_fs_alloc_obj(false);
 	if (ptr == NULL) {
-		z_free_fd(fd);
+		zvfs_free_fd(fd);
 		errno = EMFILE;
 		return -1;
 	}
@@ -110,12 +110,12 @@ int zvfs_open(const char *name, int flags)
 
 	if (rc < 0) {
 		posix_fs_free_obj(ptr);
-		z_free_fd(fd);
+		zvfs_free_fd(fd);
 		errno = -rc;
 		return -1;
 	}
 
-	z_finalize_fd(fd, ptr, &fs_fd_op_vtable);
+	zvfs_finalize_fd(fd, ptr, &fs_fd_op_vtable);
 
 	return fd;
 }
@@ -313,6 +313,40 @@ struct dirent *readdir(DIR *dirp)
 	pdirent.d_name[rc] = '\0';
 	return &pdirent;
 }
+
+#ifdef CONFIG_POSIX_THREAD_SAFE_FUNCTIONS
+int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result)
+{
+	struct dirent *dir;
+
+	errno = 0;
+
+	dir = readdir(dirp);
+	if (dir == NULL) {
+		int error = errno;
+
+		if (error != 0) {
+			if (result != NULL) {
+				*result = NULL;
+			}
+
+			return 0;
+		} else {
+			return error;
+		}
+	}
+
+	if (entry != NULL) {
+		memcpy(entry, dir, sizeof(struct dirent));
+	}
+
+	if (result != NULL) {
+		*result = entry;
+	}
+
+	return 0;
+}
+#endif /* CONFIG_POSIX_THREAD_SAFE_FUNCTIONS */
 
 /**
  * @brief Rename a file.

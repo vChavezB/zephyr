@@ -22,6 +22,7 @@
 
 #include <zephyr/logging/log.h>
 #if DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_console), zephyr_cdc_acm_uart) \
+	&& defined(CONFIG_LOG_BACKEND_UART) \
 	&& defined(CONFIG_USBD_CDC_ACM_LOG_LEVEL) \
 	&& CONFIG_USBD_CDC_ACM_LOG_LEVEL != LOG_LEVEL_NONE
 /* Prevent endless recursive logging loop and warn user about it */
@@ -31,9 +32,9 @@
 #endif
 LOG_MODULE_REGISTER(usbd_cdc_acm, CONFIG_USBD_CDC_ACM_LOG_LEVEL);
 
-NET_BUF_POOL_FIXED_DEFINE(cdc_acm_ep_pool,
-			  DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
-			  512, sizeof(struct udc_buf_info), NULL);
+UDC_BUF_POOL_DEFINE(cdc_acm_ep_pool,
+		    DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
+		    512, sizeof(struct udc_buf_info), NULL);
 
 #define CDC_ACM_DEFAULT_LINECODING	{sys_cpu_to_le32(115200), 0, 0, 8}
 #define CDC_ACM_DEFAULT_INT_EP_MPS	16
@@ -1231,7 +1232,7 @@ const static struct usb_desc_header *cdc_acm_hs_desc_##n[] = {			\
 			  &usbd_cdc_acm_api,					\
 			  (void *)DEVICE_DT_GET(DT_DRV_INST(n)), NULL);		\
 										\
-	RING_BUF_DECLARE(cdc_acm_rb_rx_##n, DT_INST_PROP(n, tx_fifo_size));	\
+	RING_BUF_DECLARE(cdc_acm_rb_rx_##n, DT_INST_PROP(n, rx_fifo_size));	\
 	RING_BUF_DECLARE(cdc_acm_rb_tx_##n, DT_INST_PROP(n, tx_fifo_size));	\
 										\
 	static struct cdc_acm_uart_data uart_data_##n = {			\

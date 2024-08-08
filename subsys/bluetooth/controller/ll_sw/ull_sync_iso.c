@@ -66,6 +66,7 @@ static void ticker_update_op_cb(uint32_t status, void *param);
 static void ticker_stop_op_cb(uint32_t status, void *param);
 static void sync_iso_disable(void *param);
 static void disabled_cb(void *param);
+static void lll_flush(void *param);
 
 static memq_link_t link_lll_prepare;
 static struct mayfly mfy_lll_prepare = {0U, 0U, &link_lll_prepare, NULL, NULL};
@@ -183,7 +184,7 @@ uint8_t ll_big_sync_create(uint8_t big_handle, uint16_t sync_handle,
 	lll->cssn_next = 0U;
 	lll->term_reason = 0U;
 
-	if (encryption) {
+	if (IS_ENABLED(CONFIG_BT_CTLR_BROADCAST_ISO_ENC) && encryption) {
 		const uint8_t BIG1[16] = {0x31, 0x47, 0x49, 0x42, };
 		const uint8_t BIG2[4]  = {0x32, 0x47, 0x49, 0x42};
 		uint8_t igltk[16];
@@ -228,11 +229,16 @@ uint8_t ll_big_sync_create(uint8_t big_handle, uint16_t sync_handle,
 
 uint8_t ll_big_sync_terminate(uint8_t big_handle, void **rx)
 {
+	static memq_link_t link;
+	static struct mayfly mfy = {0, 0, &link, NULL, lll_flush};
+
 	struct ll_sync_iso_set *sync_iso;
 	memq_link_t *link_sync_estab;
 	struct node_rx_pdu *node_rx;
 	memq_link_t *link_sync_lost;
 	struct ll_sync_set *sync;
+	struct k_sem sem;
+	uint32_t ret;
 	int err;
 
 	sync_iso = sync_iso_get(big_handle);
@@ -284,6 +290,19 @@ uint8_t ll_big_sync_terminate(uint8_t big_handle, void **rx)
 		return BT_HCI_ERR_CMD_DISALLOWED;
 	}
 
+	/* Do a blocking mayfly call to LLL context for flushing any outstanding
+	 * operations.
+	 */
+	sync_iso->flush_sem = &sem;
+	k_sem_init(&sem, 0, 1);
+	mfy.param = &sync_iso->lll;
+
+	ret = mayfly_enqueue(TICKER_USER_ID_THREAD, TICKER_USER_ID_LLL, 0, &mfy);
+	LL_ASSERT(!ret);
+	k_sem_take(&sem, K_FOREVER);
+	sync_iso->flush_sem = NULL;
+
+	/* Release resources */
 	ull_sync_iso_stream_release(sync_iso);
 
 	link_sync_lost = sync_iso->node_rx_lost.rx.hdr.link;
@@ -472,6 +491,7 @@ void ull_sync_iso_setup(struct ll_sync_iso_set *sync_iso,
 	lll->payload_count |= (uint64_t)bi->payload_count_framing[2] << 16;
 	lll->payload_count |= (uint64_t)bi->payload_count_framing[3] << 24;
 	lll->payload_count |= (uint64_t)(bi->payload_count_framing[4] & 0x7f) << 32;
+	lll->framing = (bi->payload_count_framing[4] & 0x80) >> 7;
 
 	/* Set establishment event countdown */
 	lll->establish_events = CONN_ESTAB_COUNTDOWN;
@@ -582,7 +602,7 @@ void ull_sync_iso_setup(struct ll_sync_iso_set *sync_iso,
 		slot_us = (pdu_spacing * lll->nse * num_bis) + ctrl_spacing;
 
 	} else if (lll->bis_spacing >= (lll->sub_interval * lll->nse)) {
-		/* Time reservation omitting PTC subevents in sequetial
+		/* Time reservation omitting PTC subevents in sequential
 		 * packing.
 		 */
 		slot_us = pdu_spacing * ((lll->nse * num_bis) - lll->ptc);
@@ -711,6 +731,23 @@ void ull_sync_iso_done(struct node_rx_event_done *done)
 		elapsed_event = latency_event + 1U;
 	}
 
+	/* Check for establishmet failure */
+	if (done->extra.estab_failed) {
+		uint8_t handle;
+		uint32_t ret;
+
+		/* Stop Sync ISO Ticker directly. Establishment failure has been
+		 * notified.
+		 */
+		handle = sync_iso_handle_get(sync_iso);
+		ret = ticker_stop(TICKER_INSTANCE_ID_CTLR, TICKER_USER_ID_ULL_HIGH,
+				  (TICKER_ID_SCAN_SYNC_ISO_BASE +
+				  sync_iso_handle_to_index(handle)), NULL, NULL);
+		LL_ASSERT((ret == TICKER_STATUS_SUCCESS) ||
+			  (ret == TICKER_STATUS_BUSY));
+		return;
+	}
+
 	/* Sync drift compensation and new skip calculation
 	 */
 	ticks_drift_plus = 0U;
@@ -812,18 +849,6 @@ void ull_sync_iso_done_terminate(struct node_rx_event_done *done)
 			  ticker_stop_op_cb, (void *)sync_iso);
 	LL_ASSERT((ret == TICKER_STATUS_SUCCESS) ||
 		  (ret == TICKER_STATUS_BUSY));
-}
-
-uint32_t ull_big_sync_delay(const struct lll_sync_iso *lll_iso)
-{
-	/* BT Core v5.4 - Vol 6, Part B, Section 4.4.6.4:
-	 * BIG_Sync_Delay = (Num_BIS – 1) × BIS_Spacing + (NSE – 1) × Sub_Interval + MPT.
-	 */
-	return (lll_iso->num_bis - 1) * lll_iso->bis_spacing +
-		(lll_iso->nse - 1) * lll_iso->sub_interval +
-		BYTES2US(PDU_OVERHEAD_SIZE(lll_iso->phy) +
-			lll_iso->max_pdu + (lll_iso->enc ? 4 : 0),
-			lll_iso->phy);
 }
 
 static void disable(uint8_t sync_idx)
@@ -1032,11 +1057,30 @@ static void sync_iso_disable(void *param)
 	}
 }
 
+static void lll_flush(void *param)
+{
+	struct ll_sync_iso_set *sync_iso;
+	uint8_t handle;
+
+	/* Get reference to ULL context */
+	sync_iso = HDR_LLL2ULL(param);
+	handle = sync_iso_handle_get(sync_iso);
+
+	lll_sync_iso_flush(handle, param);
+
+	if (sync_iso->flush_sem) {
+		k_sem_give(sync_iso->flush_sem);
+	}
+}
+
 static void disabled_cb(void *param)
 {
+	static memq_link_t mfy_link;
+	static struct mayfly mfy = {0U, 0U, &mfy_link, NULL, lll_flush};
 	struct ll_sync_iso_set *sync_iso;
 	struct node_rx_pdu *rx;
 	memq_link_t *link;
+	uint32_t ret;
 
 	/* Get reference to ULL context */
 	sync_iso = HDR_LLL2ULL(param);
@@ -1049,4 +1093,9 @@ static void disabled_cb(void *param)
 
 	/* Enqueue the BIG sync lost towards ULL context */
 	ll_rx_put_sched(link, rx);
+
+	mfy.param = param;
+	ret = mayfly_enqueue(TICKER_USER_ID_ULL_HIGH,
+			     TICKER_USER_ID_LLL, 0U, &mfy);
+	LL_ASSERT(!ret);
 }

@@ -17,6 +17,7 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/drivers/clock_control/stm32_clock_control.h>
+#include "clock_stm32_ll_mco.h"
 
 /* Macros to fill up prescaler values */
 #define z_ahb_prescaler(v) LL_RCC_SYSCLK_DIV_ ## v
@@ -895,6 +896,9 @@ int stm32_clock_control_init(const struct device *dev)
 	/* Update CMSIS variable */
 	SystemCoreClock = CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC;
 
+	/* configure MCO1/MCO2 based on Kconfig */
+	stm32_clock_control_mco_init();
+
 	return 0;
 }
 
@@ -903,7 +907,7 @@ int stm32_clock_control_init(const struct device *dev)
  * that the device init runs just after SOC init
  */
 DEVICE_DT_DEFINE(DT_NODELABEL(rcc),
-		    &stm32_clock_control_init,
+		    stm32_clock_control_init,
 		    NULL,
 		    NULL, NULL,
 		    PRE_KERNEL_1,

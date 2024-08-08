@@ -112,24 +112,6 @@ static struct dai_intel_ssp_plat_data *ssp_get_device_instance(uint32_t ssp_inde
 	return NULL;
 }
 
-static void ssp_acquire_port(struct dai_intel_ssp_plat_data *ssp)
-{
-	ssp->acquire_count++;
-}
-
-static void ssp_release_port(struct dai_intel_ssp_plat_data *ssp)
-{
-	if (ssp->acquire_count == 0) {
-		return;
-	}
-
-	--ssp->acquire_count;
-}
-
-static bool ssp_is_acquired(struct dai_intel_ssp_plat_data *ssp)
-{
-	return (ssp->acquire_count != 0);
-}
 
 static void dai_ssp_update_bits(struct dai_intel_ssp *dp, uint32_t reg, uint32_t mask, uint32_t val)
 {
@@ -1009,43 +991,38 @@ static void ssp_empty_rx_fifo_on_stop(struct dai_intel_ssp *dp)
 	uint32_t i, sssr, ssmidycs;
 	uint32_t entries[2];
 
-	if (ssp_is_acquired(dp->ssp_plat_data)) {
-		return;
-	}
-
 	sssr = sys_read32(dai_base(dp) + SSSR);
 
-	for (uint32_t idx = 0; idx < I2SIPCMC; ++idx) {
-		entries[0] = SSMIDyCS_RFL_VAL(sys_read32(dai_base(dp) + SSMIDyCS(idx)));
+	entries[0] = SSMIDyCS_RFL_VAL(sys_read32(dai_base(dp) + SSMIDyCS(dp->tdm_slot_group)));
 
-		while ((sys_read32(dai_base(dp) + SSMIDyCS(idx)) & SSMIDyCS_RNE) && retry--) {
-			/* Wait one sample time */
-			k_busy_wait(sample_ticks);
+	while ((sys_read32(dai_base(dp) + SSMIDyCS(dp->tdm_slot_group)) &
+		SSMIDyCS_RNE) && retry--) {
+		/* Wait one sample time */
+		k_busy_wait(sample_ticks);
 
-			entries[1] = SSMIDyCS_RFL_VAL(sys_read32(dai_base(dp) + SSMIDyCS(idx)));
-			sssr = sys_read32(dai_base(dp) + SSSR);
-			ssmidycs = sys_read32(dai_base(dp) + SSMIDyCS(idx));
+		entries[1] = SSMIDyCS_RFL_VAL(sys_read32(dai_base(dp) +
+					      SSMIDyCS(dp->tdm_slot_group)));
+		sssr = sys_read32(dai_base(dp) + SSSR);
+		ssmidycs = sys_read32(dai_base(dp) + SSMIDyCS(dp->tdm_slot_group));
 
-			if (entries[0] > entries[1]) {
-				/*
-				 * The DMA is reading the FIFO, check the status in the
-				 * next loop
-				 */
-				entries[0] = entries[1];
-			} else if (!(ssmidycs & SSMIDyCS_RFS)) {
-				/*
-				 * The DMA request is not asserted, read the FIFO
-				 * directly, otherwise let the next loop iteration to
-				 * check the status
-				 */
-				for (i = 0; i < entries[1] + 1; i++)
-					sys_read32(dai_base(dp) + SSMIDyD(idx));
-			}
-
-			sssr = sys_read32(dai_base(dp) + SSSR);
+		if (entries[0] > entries[1]) {
+			/*
+			 * The DMA is reading the FIFO, check the status in the
+			 * next loop
+			 */
+			entries[0] = entries[1];
+		} else if (!(ssmidycs & SSMIDyCS_RFS)) {
+			/*
+			 * The DMA request is not asserted, read the FIFO
+			 * directly, otherwise let the next loop iteration to
+			 * check the status
+			 */
+			for (i = 0; i < entries[1] + 1; i++)
+				sys_read32(dai_base(dp) + SSMIDyD(dp->tdm_slot_group));
 		}
-
+		sssr = sys_read32(dai_base(dp) + SSSR);
 	}
+
 	/* Just in case clear the overflow status */
 	dai_ssp_update_bits(dp, SSSR, SSSR_ROR, SSSR_ROR);
 }
@@ -1787,10 +1764,6 @@ clk:
 						    SSMIDyCS_RSRE, SSMIDyCS_RSRE);
 				dai_ssp_update_bits(dp, SSMODyCS(dp->tdm_slot_group),
 						    SSMODyCS_TSRE, SSMODyCS_TSRE);
-#else
-				dai_ssp_update_bits(dp, SSCR1,
-						    SSCR1_TSRE | SSCR1_RSRE,
-						    SSCR1_TSRE | SSCR1_RSRE);
 #endif
 				/* enable port */
 				dai_ssp_update_bits(dp, SSCR0, SSCR0_SSE, SSCR0_SSE);
@@ -1823,10 +1796,6 @@ clk:
 				for (uint32_t idx = 0; idx < I2SIPCMC; ++idx) {
 					dai_ssp_update_bits(dp, SSMIDyCS(idx), SSMIDyCS_RSRE, 0);
 				}
-#else
-				dai_ssp_update_bits(dp, SSCR1,
-						    SSCR1_TSRE | SSCR1_RSRE,
-						    0);
 #endif
 				dai_ssp_update_bits(dp, SSCR0, SSCR0_SSE, 0);
 				LOG_INF("SSE clear for SSP%d", dp->dai_index);
@@ -1900,11 +1869,42 @@ static int dai_ssp_check_aux_data(struct ssp_intel_aux_tlv *aux_tlv, int aux_len
 	return 0;
 }
 
-static int dai_ssp_parse_aux_data(struct dai_intel_ssp *dp, const void *spec_config)
+/**
+ * This function checks if the provided buffer contains valid DMA control
+ * TLV (Type-Length-Value) entries. It ensures that only specific types
+ * of DMA control settings are allowed to be modified at runtime.
+ */
+static int dai_ssp_check_dma_control(const uint8_t *aux_ptr, int aux_len)
 {
-	const struct dai_intel_ipc4_ssp_configuration_blob_ver_1_5 *blob = spec_config;
-	int aux_tlv_size = sizeof(struct ssp_intel_aux_tlv);
-	int hop, i, j, cfg_len, pre_aux_len, aux_len;
+	int hop;
+	struct ssp_intel_aux_tlv *aux_tlv;
+
+	for (int i = 0; i < aux_len; i += hop) {
+		aux_tlv = (struct ssp_intel_aux_tlv *)(aux_ptr);
+		switch (aux_tlv->type) {
+		case SSP_DMA_CLK_CONTROLS:
+		case SSP_DMA_TRANSMISSION_START:
+		case SSP_DMA_TRANSMISSION_STOP:
+		case SSP_DMA_ALWAYS_RUNNING_MODE:
+		case SSP_DMA_SYNC_DATA:
+		case SSP_DMA_CLK_CONTROLS_EXT:
+		case SSP_LINK_CLK_SOURCE:
+			break;
+		default:
+			LOG_ERR("incorect config type %u", aux_tlv->type);
+			return -EINVAL;
+		}
+
+		hop = aux_tlv->size + sizeof(struct ssp_intel_aux_tlv);
+		aux_ptr += hop;
+	}
+
+	return 0;
+}
+
+static int dai_ssp_parse_tlv(struct dai_intel_ssp *dp, const uint8_t *aux_ptr, size_t aux_len)
+{
+	int hop, i, j;
 	struct ssp_intel_aux_tlv *aux_tlv;
 	struct ssp_intel_mn_ctl *mn;
 	struct ssp_intel_clk_ctl *clk;
@@ -1916,15 +1916,6 @@ static int dai_ssp_parse_aux_data(struct dai_intel_ssp *dp, const void *spec_con
 #ifdef CONFIG_SOC_SERIES_INTEL_ADSP_ACE
 	struct ssp_intel_link_ctl *link;
 #endif
-	uint8_t *aux_ptr;
-
-	cfg_len = blob->size;
-	pre_aux_len = sizeof(*blob) + blob->i2s_mclk_control.mdivrcnt * sizeof(uint32_t);
-	aux_len = cfg_len - pre_aux_len;
-	aux_ptr = (uint8_t *)blob + pre_aux_len;
-
-	if (aux_len <= 0)
-		return 0;
 
 	for (i = 0; i < aux_len; i += hop) {
 		aux_tlv = (struct ssp_intel_aux_tlv *)(aux_ptr);
@@ -1971,15 +1962,16 @@ static int dai_ssp_parse_aux_data(struct dai_intel_ssp *dp, const void *spec_con
 		case SSP_LINK_CLK_SOURCE:
 #ifdef CONFIG_SOC_SERIES_INTEL_ADSP_ACE
 			link = (struct ssp_intel_link_ctl *)&aux_tlv->val;
-
 #if CONFIG_SOC_INTEL_ACE15_MTPM
-			sys_write32(sys_read32(dai_ip_base(dp) + I2SLCTL_OFFSET) |
+			sys_write32((sys_read32(dai_ip_base(dp) + I2SLCTL_OFFSET) &
+				    ~I2CLCTL_MLCS(0x7)) |
 				    I2CLCTL_MLCS(link->clock_source), dai_ip_base(dp) +
 				    I2SLCTL_OFFSET);
 #elif CONFIG_SOC_INTEL_ACE20_LNL || CONFIG_SOC_INTEL_ACE30_PTL
-			sys_write32(sys_read32(dai_i2svss_base(dp) + I2SLCTL_OFFSET) |
-				    I2CLCTL_MLCS(link->clock_source), dai_i2svss_base(dp) +
-				    I2SLCTL_OFFSET);
+			sys_write32((sys_read32(dai_i2svss_base(dp) + I2SLCTL_OFFSET) &
+				    ~I2CLCTL_MLCS(0x7)) |
+				    I2CLCTL_MLCS(link->clock_source),
+				    dai_i2svss_base(dp) + I2SLCTL_OFFSET);
 #endif
 			LOG_INF("link clock_source %u", link->clock_source);
 #endif
@@ -1989,11 +1981,28 @@ static int dai_ssp_parse_aux_data(struct dai_intel_ssp *dp, const void *spec_con
 			return -EINVAL;
 		}
 
-		hop = aux_tlv->size + aux_tlv_size;
+		hop = aux_tlv->size + sizeof(struct ssp_intel_aux_tlv);
 		aux_ptr += hop;
 	}
 
 	return 0;
+}
+
+static int dai_ssp_parse_aux_data(struct dai_intel_ssp *dp, const void *spec_config)
+{
+	const struct dai_intel_ipc4_ssp_configuration_blob_ver_1_5 *blob = spec_config;
+	int cfg_len, pre_aux_len, aux_len;
+	uint8_t *aux_ptr;
+
+	cfg_len = blob->size;
+	pre_aux_len = sizeof(*blob) + blob->i2s_mclk_control.mdivrcnt * sizeof(uint32_t);
+	aux_len = cfg_len - pre_aux_len;
+	aux_ptr = (uint8_t *)blob + pre_aux_len;
+
+	if (aux_len <= 0)
+		return 0;
+
+	return dai_ssp_parse_tlv(dp, aux_ptr, aux_len);
 }
 
 static int dai_ssp_set_clock_control_ver_1_5(struct dai_intel_ssp *dp,
@@ -2260,7 +2269,6 @@ static void dai_ssp_start(struct dai_intel_ssp *dp, int direction)
 #endif
 
 	dp->state[direction] = DAI_STATE_RUNNING;
-	ssp_acquire_port(dp->ssp_plat_data);
 
 	/*
 	 * Wait to get valid fifo status in clock consumer mode. TODO it's
@@ -2284,7 +2292,6 @@ static void dai_ssp_start(struct dai_intel_ssp *dp, int direction)
 static void dai_ssp_stop(struct dai_intel_ssp *dp, int direction)
 {
 	struct dai_intel_ssp_pdata *ssp = dai_get_drvdata(dp);
-	struct dai_intel_ssp_plat_data *ssp_plat_data = dai_get_plat_data(dp);
 	k_spinlock_key_t key;
 
 	key = k_spin_lock(&dp->lock);
@@ -2316,7 +2323,6 @@ static void dai_ssp_stop(struct dai_intel_ssp *dp, int direction)
 #endif
 		ssp_empty_rx_fifo_on_stop(dp);
 		dp->state[DAI_DIR_CAPTURE] = DAI_STATE_PRE_RUNNING;
-		ssp_release_port(ssp_plat_data);
 	}
 
 	/* stop Tx if needed */
@@ -2333,22 +2339,6 @@ static void dai_ssp_stop(struct dai_intel_ssp *dp, int direction)
 		dai_ssp_update_bits(dp, SSTSA, SSTSA_TXEN, 0);
 #endif
 		dp->state[DAI_DIR_PLAYBACK] = DAI_STATE_PRE_RUNNING;
-		ssp_release_port(ssp_plat_data);
-	}
-
-	/* disable SSP port if no users */
-	if (dp->state[DAI_DIR_CAPTURE] == DAI_STATE_PRE_RUNNING &&
-	    dp->state[DAI_DIR_PLAYBACK] == DAI_STATE_PRE_RUNNING &&
-	    COND_CODE_1(CONFIG_INTEL_ADSP_CAVS,
-			(!(ssp_plat_data->clk_active & SSP_CLK_BCLK_ES_REQ)), (true))) {
-		if (!ssp_is_acquired(ssp_plat_data)) {
-			dai_ssp_update_bits(dp, SSCR0, SSCR0_SSE, 0);
-			LOG_INF("%s SSE clear SSP%d", __func__, ssp_plat_data->ssp_index);
-		}
-	}
-
-	if (!ssp_is_acquired(ssp_plat_data)) {
-		dai_ssp_post_stop(dp);
 	}
 
 	k_spin_unlock(&dp->lock, key);
@@ -2468,6 +2458,54 @@ static const struct dai_properties *dai_ssp_get_properties(const struct device *
 	return prop;
 }
 
+static void ssp_acquire_ip(struct dai_intel_ssp *dp)
+{
+	struct dai_intel_ssp_plat_data *ssp = dai_get_plat_data(dp);
+
+	ssp->acquire_count++;
+
+	if (ssp->acquire_count == 1) {
+		/* Enable SSP power */
+		dai_ssp_pm_runtime_en_ssp_power(dp, ssp->ssp_index);
+
+		/* Disable dynamic clock gating before touching any register */
+		dai_ssp_pm_runtime_dis_ssp_clk_gating(dp, ssp->ssp_index);
+	}
+}
+
+static void ssp_release_ip(struct dai_intel_ssp *dp)
+{
+	struct dai_intel_ssp_plat_data *ssp = dai_get_plat_data(dp);
+
+	if (ssp->acquire_count == 0) {
+		return;
+	}
+
+	--ssp->acquire_count;
+
+	if (ssp->acquire_count == 0) {
+		/* disable SSP port if no users */
+		if (dp->state[DAI_DIR_CAPTURE] == DAI_STATE_PRE_RUNNING &&
+		    dp->state[DAI_DIR_PLAYBACK] == DAI_STATE_PRE_RUNNING &&
+		    COND_CODE_1(CONFIG_INTEL_ADSP_CAVS,
+				(!(ssp->clk_active & SSP_CLK_BCLK_ES_REQ)), (true))) {
+			dai_ssp_update_bits(dp, SSCR0, SSCR0_SSE, 0);
+			LOG_INF("%s SSE clear SSP%d", __func__, ssp->ssp_index);
+		}
+
+		dai_ssp_post_stop(dp);
+
+		dai_ssp_pm_runtime_en_ssp_clk_gating(dp, ssp->ssp_index);
+
+		dai_ssp_mclk_disable_unprepare(dp);
+		dai_ssp_bclk_disable_unprepare(dp);
+
+		/* Disable SSP power */
+		dai_ssp_pm_runtime_dis_ssp_power(dp, ssp->ssp_index);
+		ssp->is_initialized = false;
+	}
+}
+
 static int dai_ssp_probe(struct dai_intel_ssp *dp)
 {
 	struct dai_intel_ssp_plat_data *ssp_plat_data = dai_get_plat_data(dp);
@@ -2488,49 +2526,22 @@ static int dai_ssp_probe(struct dai_intel_ssp *dp)
 	dp->state[DAI_DIR_PLAYBACK] = DAI_STATE_READY;
 	dp->state[DAI_DIR_CAPTURE] = DAI_STATE_READY;
 
-	if (ssp_plat_data->is_power_en) {
-		return 0;
-	}
-
 #if CONFIG_INTEL_MN
 	/* Reset M/N, power-gating functions need it */
 	dai_ssp_mn_reset_bclk_divider(dp, ssp_plat_data->ssp_index);
 #endif
 
-	/* Enable SSP power */
-	dai_ssp_pm_runtime_en_ssp_power(dp, ssp_plat_data->ssp_index);
-
-	/* Disable dynamic clock gating before touching any register */
-	dai_ssp_pm_runtime_dis_ssp_clk_gating(dp, ssp_plat_data->ssp_index);
-
-	ssp_plat_data->is_power_en = true;
+	ssp_acquire_ip(dp);
 
 	return 0;
 }
 
 static int dai_ssp_remove(struct dai_intel_ssp *dp)
 {
-	struct dai_intel_ssp_plat_data *ssp_plat_data = dai_get_plat_data(dp);
-
-	if (ssp_is_acquired(ssp_plat_data)) {
-		k_free(dai_get_drvdata(dp));
-		dai_set_drvdata(dp, NULL);
-		return 0;
-	}
-
-	dai_ssp_pm_runtime_en_ssp_clk_gating(dp, ssp_plat_data->ssp_index);
-
-	dai_ssp_mclk_disable_unprepare(dp);
-	dai_ssp_bclk_disable_unprepare(dp);
-
-	/* Disable SSP power */
-	dai_ssp_pm_runtime_dis_ssp_power(dp, ssp_plat_data->ssp_index);
+	ssp_release_ip(dp);
 
 	k_free(dai_get_drvdata(dp));
 	dai_set_drvdata(dp, NULL);
-
-	ssp_plat_data->is_initialized = false;
-	ssp_plat_data->is_power_en = false;
 
 	return 0;
 }
@@ -2579,6 +2590,30 @@ static int ssp_init(const struct device *dev)
 	return pm_device_runtime_enable(dev);
 }
 
+static int dai_ssp_dma_control_set(const struct device *dev,
+				   const void *bespoke_cfg,
+				   size_t size)
+{
+	struct dai_intel_ssp *dp = (struct dai_intel_ssp *)dev->data;
+
+	LOG_INF("SSP%d: tlv addr = 0x%x, tlv size = %d",
+		dp->dai_index, (uint32_t)bespoke_cfg, size);
+	if (size < sizeof(struct ssp_intel_aux_tlv)) {
+		return -EINVAL;
+	}
+
+	if (dp->state[DAI_DIR_PLAYBACK] != DAI_STATE_READY ||
+		dp->state[DAI_DIR_CAPTURE] != DAI_STATE_READY) {
+		return -EIO;
+	}
+
+	if (dai_ssp_check_dma_control(bespoke_cfg, size)) {
+		return -EINVAL;
+	}
+
+	return dai_ssp_parse_tlv(dp, bespoke_cfg, size);
+}
+
 static struct dai_driver_api dai_intel_ssp_api_funcs = {
 	.probe			= pm_device_runtime_get,
 	.remove			= pm_device_runtime_put,
@@ -2586,6 +2621,7 @@ static struct dai_driver_api dai_intel_ssp_api_funcs = {
 	.config_get		= dai_ssp_config_get,
 	.trigger		= dai_ssp_trigger,
 	.get_properties		= dai_ssp_get_properties,
+	.config_update		= dai_ssp_dma_control_set,
 };
 
 

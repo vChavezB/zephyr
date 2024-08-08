@@ -30,6 +30,12 @@ LOG_MODULE_REGISTER(main);
 FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
 #endif
 
+#if !defined(CONFIG_DISK_DRIVER_FLASH) && \
+	!defined(CONFIG_DISK_DRIVER_RAM) && \
+	!defined(CONFIG_DISK_DRIVER_SDMMC)
+#error No supported disk driver enabled
+#endif
+
 #define STORAGE_PARTITION		storage_partition
 #define STORAGE_PARTITION_ID		FIXED_PARTITION_ID(STORAGE_PARTITION)
 
@@ -70,7 +76,7 @@ static int enable_usb_device_next(void)
 
 	return 0;
 }
-#endif /* IS_ENABLED(CONFIG_USB_DEVICE_STACK_NEXT) */
+#endif /* defined(CONFIG_USB_DEVICE_STACK_NEXT) */
 
 static int setup_flash(struct fs_mount_t *mnt)
 {

@@ -100,6 +100,8 @@ Current Zephyr's ESP32-C6-DevKitC board supports the following features:
 +------------+------------+-------------------------------------+
 | SPI DMA    | on-chip    | spi                                 |
 +------------+------------+-------------------------------------+
+| GDMA       | on-chip    | dma                                 |
++------------+------------+-------------------------------------+
 
 System requirements
 *******************
@@ -146,9 +148,10 @@ There are two options to be used when building an application:
 
    User can select the MCUboot bootloader by adding the following line
    to the board default configuration file.
-   ```
-   CONFIG_BOOTLOADER_MCUBOOT=y
-   ```
+
+   .. code:: cfg
+
+      CONFIG_BOOTLOADER_MCUBOOT=y
 
 Sysbuild
 ========

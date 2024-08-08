@@ -14,4 +14,7 @@ supported:
   - watchdog
   - pwm
   - rtc
+  - adc
+  - usb_device
+  - usb
 vendor: st

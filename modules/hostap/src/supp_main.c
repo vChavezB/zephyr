@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2023 Nordic Semiconductor ASA.
+ * Copyright 2024 NXP
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -45,6 +46,7 @@ static K_THREAD_STACK_DEFINE(iface_wq_stack, CONFIG_WIFI_NM_WPA_SUPPLICANT_WQ_ST
 #include "wpa_cli_zephyr.h"
 
 static const struct wifi_mgmt_ops mgmt_ops = {
+	.get_version = supplicant_get_version,
 	.scan = supplicant_scan,
 	.connect = supplicant_connect,
 	.disconnect = supplicant_disconnect,
@@ -64,13 +66,15 @@ static const struct wifi_mgmt_ops mgmt_ops = {
 	.ap_disable = supplicant_ap_disable,
 	.ap_sta_disconnect = supplicant_ap_sta_disconnect,
 #endif /* CONFIG_AP */
+	.dpp_dispatch = supplicant_dpp_dispatch,
 };
 
 DEFINE_WIFI_NM_INSTANCE(wifi_supplicant, &mgmt_ops);
 
 #define WRITE_TIMEOUT 100 /* ms */
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_INF_MON
 #define INTERFACE_EVENT_MASK (NET_EVENT_IF_ADMIN_UP | NET_EVENT_IF_ADMIN_DOWN)
-
+#endif
 struct supplicant_context {
 	struct wpa_global *supplicant;
 	struct net_mgmt_event_callback cb;
@@ -143,6 +147,7 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_INF_MON
 static int send_event(const struct wpa_supplicant_event_msg *msg)
 {
 	return zephyr_wifi_send_event(msg);
@@ -158,7 +163,7 @@ static bool is_wanted_interface(struct net_if *iface)
 
 	return true;
 }
-
+#endif
 struct wpa_supplicant *zephyr_get_handle_by_ifname(const char *ifname)
 {
 	struct wpa_supplicant *wpa_s = NULL;
@@ -232,7 +237,9 @@ static int add_interface(struct supplicant_context *ctx, struct net_if *iface)
 		goto out;
 	}
 
-	ret = wifi_nm_register_mgd_iface(wifi_nm_get_instance("wifi_supplicant"), iface);
+	ret = wifi_nm_register_mgd_type_iface(wifi_nm_get_instance("wifi_supplicant"),
+					      WIFI_TYPE_STA,
+					      iface);
 	if (ret) {
 		LOG_ERR("Failed to register mgd iface with native stack %s (%d)",
 			ifname, ret);
@@ -250,7 +257,7 @@ static int add_interface(struct supplicant_context *ctx, struct net_if *iface)
 out:
 	return ret;
 }
-
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_INF_MON
 static int del_interface(struct supplicant_context *ctx, struct net_if *iface)
 {
 	struct wpa_supplicant_event_msg msg;
@@ -347,7 +354,7 @@ out:
 
 	return ret;
 }
-
+#endif
 static void iface_work_handler(struct k_work *work)
 {
 	struct supplicant_context *ctx = CONTAINER_OF(work, struct supplicant_context,
@@ -373,7 +380,7 @@ static void submit_iface_work(struct supplicant_context *ctx,
 
 	k_work_submit_to_queue(&ctx->iface_wq, &ctx->iface_work);
 }
-
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_INF_MON
 static void interface_handler(struct net_mgmt_event_callback *cb,
 			      uint32_t mgmt_event, struct net_if *iface)
 {
@@ -402,6 +409,7 @@ static void interface_handler(struct net_mgmt_event_callback *cb,
 		return;
 	}
 }
+#endif
 
 static void iface_cb(struct net_if *iface, void *user_data)
 {
@@ -412,7 +420,7 @@ static void iface_cb(struct net_if *iface, void *user_data)
 		return;
 	}
 
-	if (!net_if_is_up(iface)) {
+	if (!net_if_is_admin_up(iface)) {
 		return;
 	}
 
@@ -425,11 +433,11 @@ static void iface_cb(struct net_if *iface, void *user_data)
 static int setup_interface_monitoring(struct supplicant_context *ctx, struct net_if *iface)
 {
 	ARG_UNUSED(iface);
-
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_INF_MON
 	net_mgmt_init_event_callback(&ctx->cb, interface_handler,
 				     INTERFACE_EVENT_MASK);
 	net_mgmt_add_event_callback(&ctx->cb);
-
+#endif
 	net_if_foreach(iface_cb, ctx);
 
 	return 0;

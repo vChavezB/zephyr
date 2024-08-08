@@ -2,19 +2,35 @@
 
 /*
  * Copyright (c) 2020 Intel Corporation
- * Copyright (c) 2021 Nordic Semiconductor ASA
+ * Copyright (c) 2021-2024 Nordic Semiconductor ASA
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/sys/byteorder.h>
-#include <zephyr/sys/check.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
+#include <zephyr/autoconf.h>
+#include <zephyr/bluetooth/buf.h>
+#include <zephyr/bluetooth/gap.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
+#include <zephyr/kernel.h>
+#include <zephyr/net/buf.h>
+#include <zephyr/sys/__assert.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/check.h>
+#include <zephyr/sys/slist.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/sys/util_macro.h>
+#include <zephyr/sys_clock.h>
+#include <zephyr/toolchain.h>
 
 #include "host/buf_view.h"
 #include "host/hci_core.h"
@@ -741,7 +757,7 @@ static struct net_buf *iso_data_pull(struct bt_conn *conn,
 				     size_t *length)
 {
 #if defined(CONFIG_BT_ISO_TX)
-	LOG_DBG("conn %p amount %d", conn, amount);
+	BT_ISO_DATA_DBG("conn %p amount %d", conn, amount);
 
 	/* Leave the PDU buffer in the queue until we have sent all its
 	 * fragments.
@@ -749,7 +765,10 @@ static struct net_buf *iso_data_pull(struct bt_conn *conn,
 	struct net_buf *frag = k_fifo_peek_head(&conn->iso.txq);
 
 	if (!frag) {
-		LOG_DBG("signaled ready but no frag available");
+		BT_ISO_DATA_DBG("signaled ready but no frag available");
+		/* Service other connections */
+		bt_tx_irq_raise();
+
 		return NULL;
 	}
 
@@ -758,6 +777,9 @@ static struct net_buf *iso_data_pull(struct bt_conn *conn,
 
 		LOG_DBG("channel has been disconnected");
 		__ASSERT_NO_MSG(b == frag);
+
+		/* Service other connections */
+		bt_tx_irq_raise();
 
 		return NULL;
 	}
@@ -775,7 +797,7 @@ static struct net_buf *iso_data_pull(struct bt_conn *conn,
 	if (last_frag) {
 		__maybe_unused struct net_buf *b = k_fifo_get(&conn->iso.txq, K_NO_WAIT);
 
-		LOG_DBG("last frag, pop buf");
+		BT_ISO_DATA_DBG("last frag, pop buf");
 		__ASSERT_NO_MSG(b == frag);
 	}
 
@@ -818,13 +840,8 @@ int conn_iso_send(struct bt_conn *conn, struct net_buf *buf, enum bt_iso_timesta
 		return -EINVAL;
 	}
 
-	/* push the TS flag on the buffer itself.
-	 * It will be popped and read back by conn before adding the ISO HCI header.
-	 */
-	net_buf_push_u8(buf, has_ts);
-
 	net_buf_put(&conn->iso.txq, buf);
-	LOG_DBG("%p put on list", buf);
+	BT_ISO_DATA_DBG("%p put on list", buf);
 
 	/* only one ISO channel per conn-object */
 	bt_conn_data_ready(conn);
@@ -854,6 +871,18 @@ static int validate_send(const struct bt_iso_chan *chan, const struct net_buf *b
 	if (!iso_conn->iso.info.can_send) {
 		LOG_DBG("Channel %p not able to send", chan);
 		return -EINVAL;
+	}
+
+	if (net_buf_headroom(buf) != BT_BUF_ISO_SIZE(0)) {
+		LOG_DBG("Buffer headroom (%d) != BT_BUF_ISO_SIZE(0) (%d) bytes",
+			net_buf_headroom(buf), BT_BUF_ISO_SIZE(0));
+
+		/* DO NOT remove this check. We rely on precise headroom further
+		 * below in the stack to determine if `buf` contains a timestamp
+		 * field or not. See conn.c:contains_iso_timestamp.
+		 */
+
+		return -EMSGSIZE;
 	}
 
 	if (buf->size < hdr_size) {
@@ -892,7 +921,7 @@ int bt_iso_chan_send(struct bt_iso_chan *chan, struct net_buf *buf, uint16_t seq
 
 	iso_conn = chan->iso;
 
-	LOG_DBG("send-iso (no ts)");
+	BT_ISO_DATA_DBG("send-iso (no ts)");
 	return conn_iso_send(iso_conn, buf, BT_ISO_TS_ABSENT);
 }
 
@@ -1140,7 +1169,7 @@ void hci_le_cis_established(struct net_buf *buf)
 	uint16_t handle = sys_le16_to_cpu(evt->conn_handle);
 	struct bt_conn *iso;
 
-	LOG_DBG("status 0x%02x handle %u", evt->status, handle);
+	LOG_DBG("status 0x%02x %s handle %u", evt->status, bt_hci_err_to_str(evt->status), handle);
 
 	/* ISO connection handles are already assigned at this point */
 	iso = bt_conn_lookup_handle(handle, BT_CONN_TYPE_ISO);
@@ -1921,6 +1950,9 @@ static void cleanup_cig(struct bt_iso_cig *cig)
 static bool valid_cig_param(const struct bt_iso_cig_param *param, bool advanced,
 			    const struct bt_iso_cig *cig)
 {
+	bool is_c_to_p = false;
+	bool is_p_to_c = false;
+
 	if (param == NULL) {
 		return false;
 	}
@@ -1929,17 +1961,22 @@ static bool valid_cig_param(const struct bt_iso_cig_param *param, bool advanced,
 		struct bt_iso_chan *cis = param->cis_channels[i];
 
 		if (cis == NULL) {
-			LOG_DBG("cis_channels[%d]: NULL channel", i);
+			LOG_DBG("cis_channels[%u]: NULL channel", i);
+			return false;
+		}
+
+		if (cis->qos == NULL) {
+			LOG_DBG("cis_channels[%u]: NULL QoS", i);
 			return false;
 		}
 
 		if (cis->iso != NULL && !cis_is_in_cig(cig, cis)) {
-			LOG_DBG("cis_channels[%d]: already allocated to CIG %p", i, get_cig(cis));
+			LOG_DBG("cis_channels[%u]: already allocated to CIG %p", i, get_cig(cis));
 			return false;
 		}
 
 		if (!valid_chan_qos(cis->qos, advanced)) {
-			LOG_DBG("cis_channels[%d]: Invalid QOS", i);
+			LOG_DBG("cis_channels[%u]: Invalid QOS", i);
 			return false;
 		}
 
@@ -1948,6 +1985,14 @@ static bool valid_cig_param(const struct bt_iso_cig_param *param, bool advanced,
 				LOG_DBG("ISO %p duplicated at index %u and %u", cis, i, j);
 				return false;
 			}
+		}
+
+		if (cis->qos->rx != NULL && cis->qos->rx->sdu != 0U) {
+			is_p_to_c = true;
+		}
+
+		if (cis->qos->tx != NULL && cis->qos->tx->sdu != 0U) {
+			is_c_to_p = true;
 		}
 	}
 
@@ -1970,25 +2015,30 @@ static bool valid_cig_param(const struct bt_iso_cig_param *param, bool advanced,
 		return false;
 	}
 
-	if (!IN_RANGE(param->c_to_p_interval, BT_ISO_SDU_INTERVAL_MIN, BT_ISO_SDU_INTERVAL_MAX)) {
+	if (is_c_to_p &&
+	    !IN_RANGE(param->c_to_p_interval, BT_ISO_SDU_INTERVAL_MIN, BT_ISO_SDU_INTERVAL_MAX)) {
 		LOG_DBG("Invalid C to P interval: %u", param->c_to_p_interval);
 		return false;
 	}
 
-	if (!IN_RANGE(param->p_to_c_interval, BT_ISO_SDU_INTERVAL_MIN, BT_ISO_SDU_INTERVAL_MAX)) {
+	if (is_p_to_c &&
+	    !IN_RANGE(param->p_to_c_interval, BT_ISO_SDU_INTERVAL_MIN, BT_ISO_SDU_INTERVAL_MAX)) {
 		LOG_DBG("Invalid P to C interval: %u", param->p_to_c_interval);
 		return false;
 	}
 
-	if (!advanced &&
-	    !IN_RANGE(param->c_to_p_latency, BT_ISO_LATENCY_MIN, BT_ISO_LATENCY_MAX)) {
-		LOG_DBG("Invalid C to P latency: %u", param->c_to_p_latency);
-		return false;
-	}
-	if (!advanced &&
-	    !IN_RANGE(param->p_to_c_latency, BT_ISO_LATENCY_MIN, BT_ISO_LATENCY_MAX)) {
-		LOG_DBG("Invalid P to C latency: %u", param->p_to_c_latency);
-		return false;
+	if (!advanced) {
+		if (is_c_to_p &&
+		    !IN_RANGE(param->c_to_p_latency, BT_ISO_LATENCY_MIN, BT_ISO_LATENCY_MAX)) {
+			LOG_DBG("Invalid C to P latency: %u", param->c_to_p_latency);
+			return false;
+		}
+
+		if (is_p_to_c &&
+		    !IN_RANGE(param->p_to_c_latency, BT_ISO_LATENCY_MIN, BT_ISO_LATENCY_MAX)) {
+			LOG_DBG("Invalid P to C latency: %u", param->p_to_c_latency);
+			return false;
+		}
 	}
 
 #if defined(CONFIG_BT_ISO_TEST_PARAMS)
@@ -2291,7 +2341,8 @@ void bt_iso_security_changed(struct bt_conn *acl, uint8_t hci_status)
 			param[param_count].iso_chan = iso_chan;
 			param_count++;
 		} else {
-			LOG_DBG("Failed to encrypt ACL %p for ISO %p: %u", acl, iso, hci_status);
+			LOG_DBG("Failed to encrypt ACL %p for ISO %p: %u %s",
+				acl, iso, hci_status, bt_hci_err_to_str(hci_status));
 
 			/* We utilize the disconnected callback to make the
 			 * upper layers aware of the error
@@ -2518,7 +2569,7 @@ int bt_iso_chan_connect(const struct bt_iso_connect_param *param, size_t count)
 	 */
 	err = iso_chan_connect_security(param, count);
 	if (err != 0) {
-		LOG_DBG("Failed to initate security for all CIS: %d", err);
+		LOG_DBG("Failed to initiate security for all CIS: %d", err);
 		return err;
 	}
 #endif /* CONFIG_BT_SMP */
@@ -3010,7 +3061,8 @@ void hci_le_big_complete(struct net_buf *buf)
 	big = lookup_big_by_handle(evt->big_handle);
 	atomic_clear_bit(big->flags, BT_BIG_PENDING);
 
-	LOG_DBG("BIG[%u] %p completed, status 0x%02x", big->handle, big, evt->status);
+	LOG_DBG("BIG[%u] %p completed, status 0x%02x %s",
+		big->handle, big, evt->status, bt_hci_err_to_str(evt->status));
 
 	if (evt->status || evt->num_bis != big->num_bis) {
 		if (evt->status == BT_HCI_ERR_SUCCESS && evt->num_bis != big->num_bis) {
@@ -3184,7 +3236,8 @@ void hci_le_big_sync_established(struct net_buf *buf)
 	big = lookup_big_by_handle(evt->big_handle);
 	atomic_clear_bit(big->flags, BT_BIG_SYNCING);
 
-	LOG_DBG("BIG[%u] %p sync established, status 0x%02x", big->handle, big, evt->status);
+	LOG_DBG("BIG[%u] %p sync established, status 0x%02x %s",
+		big->handle, big, evt->status, bt_hci_err_to_str(evt->status));
 
 	if (evt->status || evt->num_bis != big->num_bis) {
 		if (evt->status == BT_HCI_ERR_SUCCESS && evt->num_bis != big->num_bis) {
@@ -3253,7 +3306,7 @@ static int hci_le_big_create_sync(const struct bt_le_per_adv_sync *sync, struct 
 	req->num_bis = big->num_bis;
 	/* Transform from bitfield to array */
 	for (int i = 1; i <= BT_ISO_MAX_GROUP_ISO_COUNT; i++) {
-		if (param->bis_bitfield & BIT(i)) {
+		if (param->bis_bitfield & BT_ISO_BIS_INDEX_BIT(i)) {
 			if (bit_idx == big->num_bis) {
 				LOG_DBG("BIG cannot contain %u BISes", bit_idx + 1);
 				return -EINVAL;
@@ -3297,7 +3350,7 @@ int bt_iso_big_sync(struct bt_le_per_adv_sync *sync, struct bt_iso_big_sync_para
 		return -EINVAL;
 	}
 
-	CHECKIF(param->bis_bitfield <= BIT(0)) {
+	CHECKIF(param->bis_bitfield == 0U || param->bis_bitfield > BIT_MASK(BT_ISO_BIS_INDEX_MAX)) {
 		LOG_DBG("Invalid BIS bitfield 0x%08x", param->bis_bitfield);
 		return -EINVAL;
 	}
