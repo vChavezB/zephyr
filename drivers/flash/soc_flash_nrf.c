@@ -23,13 +23,13 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(flash_nrf);
 
-#if DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf51_flash_controller))
+#if DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf51_flash_controller), okay)
 #define DT_DRV_COMPAT nordic_nrf51_flash_controller
-#elif DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf52_flash_controller))
+#elif DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf52_flash_controller), okay)
 #define DT_DRV_COMPAT nordic_nrf52_flash_controller
-#elif DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf53_flash_controller))
+#elif DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf53_flash_controller), okay)
 #define DT_DRV_COMPAT nordic_nrf53_flash_controller
-#elif DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf91_flash_controller))
+#elif DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf91_flash_controller), okay)
 #define DT_DRV_COMPAT nordic_nrf91_flash_controller
 #else
 #error No matching compatible for soc_flash_nrf.c
@@ -145,26 +145,7 @@ static void nvmc_wait_ready(void)
 static int flash_nrf_read(const struct device *dev, off_t addr,
 			    void *data, size_t len)
 {
-	const bool within_uicr = is_uicr_addr_valid(addr, len);
-
-	if (is_regular_addr_valid(addr, len)) {
-		addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
-	} else if (!within_uicr) {
-		LOG_ERR("invalid address: 0x%08lx:%zu",
-				(unsigned long)addr, len);
-		return -EINVAL;
-	}
-
-	if (!len) {
-		return 0;
-	}
-
-#if CONFIG_SOC_FLASH_NRF_UICR && IS_ENABLED(NRF91_ERRATA_7_ENABLE_WORKAROUND)
-	if (within_uicr) {
-		nrf_buffer_read_91_uicr(data, (uint32_t)addr, len);
-		return 0;
-	}
-#endif
+	addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
 
 	nrf_nvmc_buffer_read(data, (uint32_t)addr, len);
 
@@ -300,8 +281,8 @@ static int nrf_flash_init(const struct device *dev)
 #endif /* !CONFIG_SOC_FLASH_NRF_RADIO_SYNC_NONE */
 
 #if defined(CONFIG_FLASH_PAGE_LAYOUT)
-	dev_layout.pages_count = nrfx_nvmc_flash_page_count_get();
-	dev_layout.pages_size = nrfx_nvmc_flash_page_size_get();
+	dev_layout.pages_count = 256;
+	dev_layout.pages_size = 4096;
 #endif
 
 	return 0;
