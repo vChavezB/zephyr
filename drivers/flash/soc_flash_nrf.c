@@ -23,13 +23,13 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(flash_nrf);
 
-#if DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf51_flash_controller), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf51_flash_controller))
 #define DT_DRV_COMPAT nordic_nrf51_flash_controller
-#elif DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf52_flash_controller), okay)
+#elif DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf52_flash_controller))
 #define DT_DRV_COMPAT nordic_nrf52_flash_controller
-#elif DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf53_flash_controller), okay)
+#elif DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf53_flash_controller))
 #define DT_DRV_COMPAT nordic_nrf53_flash_controller
-#elif DT_NODE_HAS_STATUS(DT_INST(0, nordic_nrf91_flash_controller), okay)
+#elif DT_NODE_HAS_STATUS_OKAY(DT_INST(0, nordic_nrf91_flash_controller))
 #define DT_DRV_COMPAT nordic_nrf91_flash_controller
 #else
 #error No matching compatible for soc_flash_nrf.c
@@ -145,7 +145,7 @@ static void nvmc_wait_ready(void)
 static int flash_nrf_read(const struct device *dev, off_t addr,
 			    void *data, size_t len)
 {
-const bool within_uicr = is_uicr_addr_valid(addr, len);
+	const bool within_uicr = is_uicr_addr_valid(addr, len);
 
 	if (is_regular_addr_valid(addr, len)) {
 		addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
@@ -175,12 +175,11 @@ static int flash_nrf_write(const struct device *dev, off_t addr,
 			     const void *data, size_t len)
 {
 	int ret;
-	return 0;
 
 	if (is_regular_addr_valid(addr, len)) {
 		addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
 	} else if (!is_uicr_addr_valid(addr, len)) {
-		LOG_ERR("write invalid address: 0x%08lx:%zu",
+		LOG_ERR("invalid address: 0x%08lx:%zu",
 				(unsigned long)addr, len);
 		return -EINVAL;
 	}
@@ -234,18 +233,18 @@ static int flash_nrf_erase(const struct device *dev, off_t addr, size_t size)
 		addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
 #ifdef CONFIG_SOC_FLASH_NRF_UICR
 	} else if (addr != (off_t)NRF_UICR || size != sizeof(*NRF_UICR)) {
-		LOG_ERR("erase 1 invalid address: 0x%08lx:%zu",
+		LOG_ERR("invalid address: 0x%08lx:%zu",
 				(unsigned long)addr, size);
 		return -EINVAL;
 	}
 #else
 	} else {
-		LOG_ERR("erase 2 invalid address: 0x%08lx:%zu",
+		LOG_ERR("invalid address: 0x%08lx:%zu",
 				(unsigned long)addr, size);
 		return -EINVAL;
 	}
 #endif /* CONFIG_SOC_FLASH_NRF_UICR */
-	return 0;
+
 	SYNC_LOCK();
 
 #ifndef CONFIG_SOC_FLASH_NRF_RADIO_SYNC_NONE
