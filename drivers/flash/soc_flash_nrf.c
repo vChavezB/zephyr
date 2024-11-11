@@ -104,7 +104,7 @@ static inline bool is_within_bounds(off_t addr, size_t len, off_t boundary_start
 
 static inline bool is_regular_addr_valid(off_t addr, size_t len)
 {
-	return is_within_bounds(addr, len, 0, 256*4096);
+	return is_within_bounds(addr, len, 0, nrfx_nvmc_flash_size_get());
 }
 
 static inline bool is_uicr_addr_valid(off_t addr, size_t len)
@@ -145,7 +145,26 @@ static void nvmc_wait_ready(void)
 static int flash_nrf_read(const struct device *dev, off_t addr,
 			    void *data, size_t len)
 {
-	addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
+const bool within_uicr = is_uicr_addr_valid(addr, len);
+
+	if (is_regular_addr_valid(addr, len)) {
+		addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
+	} else if (!within_uicr) {
+		LOG_ERR("invalid address: 0x%08lx:%zu",
+				(unsigned long)addr, len);
+		return -EINVAL;
+	}
+
+	if (!len) {
+		return 0;
+	}
+
+#if CONFIG_SOC_FLASH_NRF_UICR && IS_ENABLED(NRF91_ERRATA_7_ENABLE_WORKAROUND)
+	if (within_uicr) {
+		nrf_buffer_read_91_uicr(data, (uint32_t)addr, len);
+		return 0;
+	}
+#endif
 
 	nrf_nvmc_buffer_read(data, (uint32_t)addr, len);
 
@@ -196,10 +215,9 @@ static int flash_nrf_write(const struct device *dev, off_t addr,
 
 static int flash_nrf_erase(const struct device *dev, off_t addr, size_t size)
 {
-	uint32_t pg_size = 4096;
+	uint32_t pg_size = nrfx_nvmc_flash_page_size_get();
 	uint32_t n_pages = size / pg_size;
 	int ret;
-	return 0;
 
 	if (is_regular_addr_valid(addr, size)) {
 		/* Erase can only be done per page */
@@ -227,7 +245,7 @@ static int flash_nrf_erase(const struct device *dev, off_t addr, size_t size)
 		return -EINVAL;
 	}
 #endif /* CONFIG_SOC_FLASH_NRF_UICR */
-
+	return 0;
 	SYNC_LOCK();
 
 #ifndef CONFIG_SOC_FLASH_NRF_RADIO_SYNC_NONE
@@ -283,8 +301,8 @@ static int nrf_flash_init(const struct device *dev)
 #endif /* !CONFIG_SOC_FLASH_NRF_RADIO_SYNC_NONE */
 
 #if defined(CONFIG_FLASH_PAGE_LAYOUT)
-	dev_layout.pages_count = 256;
-	dev_layout.pages_size = 4096;
+	dev_layout.pages_count = nrfx_nvmc_flash_page_count_get();
+	dev_layout.pages_size = nrfx_nvmc_flash_page_size_get();
 #endif
 
 	return 0;
@@ -339,7 +357,7 @@ static int write_synchronously(off_t addr, const void *data, size_t len)
 
 static int erase_op(void *context)
 {
-	uint32_t pg_size = 4096;
+	uint32_t pg_size = nrfx_nvmc_flash_page_size_get();
 	struct flash_context *e_ctx = context;
 
 #ifndef CONFIG_SOC_FLASH_NRF_RADIO_SYNC_NONE
