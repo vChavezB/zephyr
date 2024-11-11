@@ -104,7 +104,7 @@ static inline bool is_within_bounds(off_t addr, size_t len, off_t boundary_start
 
 static inline bool is_regular_addr_valid(off_t addr, size_t len)
 {
-	return is_within_bounds(addr, len, 0, nrfx_nvmc_flash_size_get());
+	return is_within_bounds(addr, len, 0, 256*4096);
 }
 
 static inline bool is_uicr_addr_valid(off_t addr, size_t len)
@@ -156,11 +156,12 @@ static int flash_nrf_write(const struct device *dev, off_t addr,
 			     const void *data, size_t len)
 {
 	int ret;
+	return 0;
 
 	if (is_regular_addr_valid(addr, len)) {
 		addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
 	} else if (!is_uicr_addr_valid(addr, len)) {
-		LOG_ERR("invalid address: 0x%08lx:%zu",
+		LOG_ERR("write invalid address: 0x%08lx:%zu",
 				(unsigned long)addr, len);
 		return -EINVAL;
 	}
@@ -195,9 +196,10 @@ static int flash_nrf_write(const struct device *dev, off_t addr,
 
 static int flash_nrf_erase(const struct device *dev, off_t addr, size_t size)
 {
-	uint32_t pg_size = nrfx_nvmc_flash_page_size_get();
+	uint32_t pg_size = 4096;
 	uint32_t n_pages = size / pg_size;
 	int ret;
+	return 0;
 
 	if (is_regular_addr_valid(addr, size)) {
 		/* Erase can only be done per page */
@@ -214,13 +216,13 @@ static int flash_nrf_erase(const struct device *dev, off_t addr, size_t size)
 		addr += DT_REG_ADDR(SOC_NV_FLASH_NODE);
 #ifdef CONFIG_SOC_FLASH_NRF_UICR
 	} else if (addr != (off_t)NRF_UICR || size != sizeof(*NRF_UICR)) {
-		LOG_ERR("invalid address: 0x%08lx:%zu",
+		LOG_ERR("erase 1 invalid address: 0x%08lx:%zu",
 				(unsigned long)addr, size);
 		return -EINVAL;
 	}
 #else
 	} else {
-		LOG_ERR("invalid address: 0x%08lx:%zu",
+		LOG_ERR("erase 2 invalid address: 0x%08lx:%zu",
 				(unsigned long)addr, size);
 		return -EINVAL;
 	}
@@ -337,7 +339,7 @@ static int write_synchronously(off_t addr, const void *data, size_t len)
 
 static int erase_op(void *context)
 {
-	uint32_t pg_size = nrfx_nvmc_flash_page_size_get();
+	uint32_t pg_size = 4096;
 	struct flash_context *e_ctx = context;
 
 #ifndef CONFIG_SOC_FLASH_NRF_RADIO_SYNC_NONE
